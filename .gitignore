@@ -1,0 +1,13 @@
+# never commit: error-report webhook (written by build.ps1)
+artsafe/_secrets.py
+
+.venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.zip
+*.spec
+icon.ico
+icon.png
+.pytest_cache/
