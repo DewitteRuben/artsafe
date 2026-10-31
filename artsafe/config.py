@@ -11,12 +11,16 @@ APP_NAME = "ArtSafe"
 # Photoshop, Photoshop large document, Clip Studio Paint, Illustrator. Always backed up.
 REQUIRED_EXTENSIONS = [".psd", ".psb", ".clip", ".ai"]
 
-DEFAULT_EXTENSIONS = [
-    ".psd", ".psb", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif", ".bmp",
-    ".webp", ".heic", ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng",
-    ".ai", ".eps", ".svg", ".pdf", ".kra", ".clip", ".procreate", ".xcf", ".afphoto",
-    ".afdesign", ".sai", ".sai2", ".mdp",
+# Working files of drawing apps: these are what gets backed up by default.
+DRAWING_EXTENSIONS = REQUIRED_EXTENSIONS + [
+    ".kra", ".procreate", ".sai", ".sai2", ".mdp", ".xcf", ".afphoto", ".afdesign",
 ]
+# Exports, references and photos: only when she turns this on (art folders can hold thousands).
+IMAGE_EXTENSIONS = [
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".gif", ".bmp", ".webp", ".heic",
+    ".raw", ".cr2", ".cr3", ".nef", ".arw", ".dng", ".eps", ".svg", ".pdf",
+]
+DEFAULT_EXTENSIONS = list(DRAWING_EXTENSIONS)
 
 
 def app_data_dir() -> Path:
@@ -70,6 +74,9 @@ def detect_cloud_folders() -> dict[str, Path]:
 class Config:
     watched_folders: list[str] = field(default_factory=list)
     extensions: list[str] = field(default_factory=lambda: list(DEFAULT_EXTENSIONS))
+    include_images: bool = False  # also back up PNG/JPG/... exports and references
+    # set when an older version backed up images by default; she's asked once about cleaning up
+    pending_image_cleanup: bool = False
     vault_dir: str = field(default_factory=lambda: str(default_vault_dir()))
     # Retention: keep every version this many days, then one per day up to keep_daily_days.
     keep_all_days: int = 7
@@ -116,10 +123,21 @@ class Config:
                 cfg.cloud_enabled = True
                 cfg.cloud_dir = str(clouds["OneDrive"] / "ArtSafe Backup")
         cfg.extensions = [e.lower() if e.startswith(".") else "." + e.lower() for e in cfg.extensions]
+        if p.exists() and ".png" in cfg.extensions and not cfg.include_images:
+            # 1.0.0 backed up every image by default; switch to drawing files only
+            cfg.extensions = list(DRAWING_EXTENSIONS)
+            cfg.pending_image_cleanup = True
+            cfg.save()
         for ext in REQUIRED_EXTENSIONS:
             if ext not in cfg.extensions:
                 cfg.extensions.append(ext)
         return cfg
+
+    def active_extensions(self) -> set[str]:
+        exts = set(self.extensions) | set(REQUIRED_EXTENSIONS)
+        if self.include_images:
+            exts |= set(IMAGE_EXTENSIONS)
+        return exts
 
     def save(self) -> None:
         p = self.path()
@@ -134,7 +152,7 @@ class Config:
         name = p.name
         if name.startswith("~") or name.startswith(".") or name.lower() == "thumbs.db":
             return False
-        if p.suffix.lower() not in self.extensions:
+        if p.suffix.lower() not in self.active_extensions():
             return False
         try:
             vault = Path(self.vault_dir).resolve()

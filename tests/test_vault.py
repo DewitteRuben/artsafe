@@ -24,6 +24,7 @@ def env(tmp_path):
         vault_dir=str(tmp_path / "vault"),
         cloud_enabled=True,
         cloud_dir=str(tmp_path / "cloud"),
+        include_images=True,  # tests use PNGs as stand-in art
     )
     v = Vault(cfg)
     yield cfg, v, art, tmp_path

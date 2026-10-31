@@ -137,7 +137,6 @@ class Snapshotter:
         self.vault = vault
         self.on_backup = on_backup
         self.on_status = on_status
-        self.staging = Path(cfg.vault_dir) / "staging"
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._manual = False
@@ -145,6 +144,10 @@ class Snapshotter:
         self._last_input_at_snapshot: int | None = None
         self._thread: threading.Thread | None = None
         self.last_result = ""
+
+    @property
+    def staging(self) -> Path:
+        return Path(self.vault.root) / "staging"  # follows the backups if they're moved
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="artsafe-photoshop", daemon=True)

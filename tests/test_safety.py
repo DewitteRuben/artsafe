@@ -24,7 +24,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
     art = tmp_path / "Art"
     art.mkdir()
-    cfg = Config(watched_folders=[str(art)], vault_dir=str(tmp_path / "vault"))
+    cfg = Config(watched_folders=[str(art)], vault_dir=str(tmp_path / "vault"),
+                 include_images=True)  # tests use PNGs as stand-in art
     v = Vault(cfg)
     alerts = []
     e = Engine(cfg, v, on_deleted=alerts.append)

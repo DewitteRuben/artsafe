@@ -55,7 +55,11 @@ def message_box(button="Yes", timeout=10):
                 btn = [b for b in w.descendants(control_type="Button") if b.window_text() == button]
                 if btn:
                     msg = "\n".join(t for t in texts if t)
-                    btn[0].click_input()
+                    try:
+                        w.set_focus()
+                    except Exception:
+                        pass
+                    btn[0].invoke()  # works even if another window is in front
                     time.sleep(0.8)
                     return msg
         time.sleep(0.3)

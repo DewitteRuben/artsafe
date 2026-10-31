@@ -77,7 +77,11 @@ def path_key(p: str | Path) -> str:
 class Vault:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.root = Path(cfg.vault_dir)
+        self.lock = threading.RLock()
+        self._open(Path(cfg.vault_dir))
+
+    def _open(self, root: Path) -> None:
+        self.root = root
         self.blobs = self.root / "blobs"
         self.thumbs = self.root / "thumbs"
         self.tmp = self.root / "tmp"
@@ -88,7 +92,6 @@ class Vault:
                 leftover.unlink()
             except OSError:
                 pass
-        self.lock = threading.RLock()
         self.db = sqlite3.connect(str(self.root / "index.db"), check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(
@@ -183,8 +186,10 @@ class Vault:
             dest.parent.mkdir(parents=True, exist_ok=True)
             if dest.exists():
                 tmp.unlink(missing_ok=True)
-            else:
+            elif tmp.parent == self.tmp:
                 os.replace(tmp, dest)
+            else:  # backups were moved to another drive while this file was being copied
+                shutil.move(str(tmp), str(dest))
             if row is None:
                 cur = self.db.execute(
                     "INSERT INTO files(path, path_key, last_size, last_mtime, kind, app) VALUES(?,?,?,?,?,?)",
@@ -495,8 +500,8 @@ class Vault:
         for vid in ids:
             self.db.execute("DELETE FROM versions WHERE id=?", (vid,))
 
-    def _collect_garbage(self) -> None:
-        cutoff = time.time() - GC_GRACE_SECONDS
+    def _collect_garbage(self, grace: float | None = None) -> None:
+        cutoff = time.time() - (GC_GRACE_SECONDS if grace is None else grace)
         with self.lock:
             used = {r[0] for r in self.db.execute("SELECT DISTINCT blob FROM versions")}
             for folder in (self.blobs, self.thumbs):
@@ -512,3 +517,110 @@ class Vault:
     def close(self) -> None:
         with self.lock:
             self.db.close()
+
+    # ---------- file types she no longer wants backed up ----------
+    def _file_ids_not_matching(self, keep_exts: set[str]) -> list[int]:
+        with self.lock:
+            rows = self.db.execute("SELECT id, path FROM files WHERE kind='file'").fetchall()
+        return [i for i, p in rows if Path(p).suffix.lower() not in keep_exts]
+
+    def unwanted_backup_size(self, keep_exts: set[str]) -> tuple[int, int]:
+        """(files, bytes that removing their backups would free) for types outside keep_exts."""
+        ids = self._file_ids_not_matching(keep_exts)
+        if not ids:
+            return 0, 0
+        with self.lock:
+            marks = ",".join("?" * len(ids))
+            blobs = {r[0]: r[1] for r in self.db.execute(
+                f"SELECT blob, MAX(size) FROM versions WHERE file_id IN ({marks}) GROUP BY blob", ids)}
+            shared = {r[0] for r in self.db.execute(
+                f"SELECT DISTINCT blob FROM versions WHERE file_id NOT IN ({marks})", ids)}
+        return len(ids), sum(size for b, size in blobs.items() if b not in shared)
+
+    def remove_backups_of_other_types(self, keep_exts: set[str]) -> int:
+        """Delete backups of files whose type isn't in keep_exts. Her own files aren't touched."""
+        ids = self._file_ids_not_matching(keep_exts)
+        with self.lock:
+            for i in ids:
+                self.db.execute("DELETE FROM versions WHERE file_id=?", (i,))
+                self.db.execute("DELETE FROM files WHERE id=?", (i,))
+            self.db.commit()
+        self._collect_garbage(grace=0)  # unreferenced on purpose: free the space right away
+        log.info("Removed backups of %d files of types she no longer backs up", len(ids))
+        return len(ids)
+
+    # ---------- moving to another folder / drive ----------
+    def size_on_disk(self) -> tuple[int, int]:
+        """(files, bytes) in the backup folder."""
+        n = total = 0
+        for f in self.root.rglob("*"):
+            if f.is_file() and f.parent != self.tmp:
+                n += 1
+                total += f.stat().st_size
+        return n, total
+
+    def check_new_location(self, new_root: Path) -> str | None:
+        """A reason the folder can't be used, or None if it's fine."""
+        new_root = Path(os.path.abspath(new_root))
+        old = Path(os.path.abspath(self.root))
+        if path_key(new_root) == path_key(old):
+            return "That's already where your backups are."
+        if path_key(old) in [path_key(p) for p in new_root.parents] or \
+                path_key(new_root) in [path_key(p) for p in old.parents]:
+            return "Pick a folder that isn't inside (or around) the current backup folder."
+        if self.cfg.cloud_dir:
+            cloud = Path(os.path.abspath(self.cfg.cloud_dir))
+            if path_key(new_root) == path_key(cloud) or path_key(cloud) in [path_key(p) for p in new_root.parents]:
+                return "Don't put backups inside the cloud folder: it would upload every old version."
+        if new_root.exists() and any(new_root.iterdir()):
+            return "Pick an empty folder (or let ArtSafe create one)."
+        anchor = Path(new_root.anchor)
+        if not anchor.exists():
+            return f"Drive {new_root.anchor} isn't available."
+        try:
+            new_root.mkdir(parents=True, exist_ok=True)
+            probe = new_root / ".artsafe-write-test"
+            probe.write_bytes(b"ok")
+            probe.unlink()
+        except OSError as e:
+            return f"ArtSafe can't write there ({e.strerror or e})."
+        _, need = self.size_on_disk()
+        free = shutil.disk_usage(new_root).free
+        if free - need < MIN_FREE_BYTES:
+            return (f"Not enough space there: backups need {need / 1024**3:.1f} GB and that drive has "
+                    f"{free / 1024**3:.1f} GB free (ArtSafe keeps at least 5 GB free).")
+        return None
+
+    def relocate(self, new_root: str | Path, progress=lambda done, total: None) -> Path:
+        """Move all backups to new_root. Copies and checks everything before deleting the old copy.
+
+        Backups wait while this runs. On any error the old location stays in use, untouched.
+        """
+        new_root = Path(os.path.abspath(new_root))
+        problem = self.check_new_location(new_root)
+        if problem:
+            raise ValueError(problem)
+        old_root = self.root
+        with self.lock:
+            self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.db.close()
+            try:
+                files = [f for f in old_root.rglob("*") if f.is_file() and f.parent != self.tmp]
+                total = sum(f.stat().st_size for f in files)
+                done = 0
+                for f in files:
+                    target = new_root / f.relative_to(old_root)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(f, target)
+                    if target.stat().st_size != f.stat().st_size:
+                        raise OSError(f"copy of {f.name} is incomplete")
+                    done += f.stat().st_size
+                    progress(done, total)
+            except BaseException:
+                shutil.rmtree(new_root, ignore_errors=True)
+                self._open(old_root)
+                raise
+            self._open(new_root)
+            self.cfg.vault_dir = str(new_root)
+        shutil.rmtree(old_root, ignore_errors=True)  # everything is safely in the new place
+        return new_root

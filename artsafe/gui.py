@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -13,7 +14,7 @@ from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFileDialog, QFileIconProvider, QFormLayout,
+    QApplication, QCheckBox, QDoubleSpinBox, QProgressDialog, QFileDialog, QFileIconProvider, QFormLayout,
     QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMenu, QMessageBox, QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget,
     QSystemTrayIcon, QVBoxLayout, QWidget,
@@ -112,9 +113,37 @@ def use_light_theme(app: QApplication) -> None:
     app.setPalette(pal)
 
 
+def arrow_file(direction: str) -> str:
+    import tempfile
+
+    path = Path(tempfile.gettempdir()) / f"artsafe-arrow-{direction}.png"
+    if not path.exists():
+        pm = QPixmap(20, 20)
+        pm.fill(Qt.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#4b4a5a"))
+        from PySide6.QtGui import QPolygonF
+        pts = [_pt(5, 13), _pt(15, 13), _pt(10, 7)] if direction == "up" else [_pt(5, 7), _pt(15, 7), _pt(10, 13)]
+        p.drawPolygon(QPolygonF(pts))
+        p.end()
+        pm.save(str(path))
+    return str(path).replace("\\", "/")
+
+
 def app_style() -> str:
     check = checkmark_file()
+    up, down = arrow_file("up"), arrow_file("down")
     return STYLE + f"""
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-origin: padding; subcontrol-position: top right;
+    width: 20px; border-left: 1px solid #e6e4f0; border-top-right-radius: 8px; background: #faf9fd; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-origin: padding; subcontrol-position: bottom right;
+    width: 20px; border-left: 1px solid #e6e4f0; border-bottom-right-radius: 8px; background: #faf9fd; }}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover, QDoubleSpinBox::up-button:hover,
+QDoubleSpinBox::down-button:hover {{ background: #ece8ff; }}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url({up}); width: 10px; height: 10px; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: url({down}); width: 10px; height: 10px; }}
 QCheckBox::indicator:checked {{ image: url({check}); }}
 QListView::indicator {{ width: 18px; height: 18px; border: 1.5px solid #9b98ad; border-radius: 5px; background: #ffffff; }}
 QListView::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: url({check}); }}
@@ -227,6 +256,32 @@ class Bridge(QObject):
     snapshot_done = Signal(str)
     update_ready = Signal(str, object)
     update_status = Signal(str)
+
+
+class _Mover(QObject):
+    progress = Signal(int, int)
+    finished = Signal(bool, str)
+
+
+def best_backup_drive(exclude: str = "") -> str | None:
+    """The fixed drive (other than `exclude`) with the most free space, e.g. 'D:\\'."""
+    import ctypes
+    import string as _s
+
+    best, best_free = None, 0
+    for letter in _s.ascii_uppercase[2:]:
+        root = f"{letter}:\\"
+        if exclude and root.lower() == exclude.lower():
+            continue
+        if ctypes.windll.kernel32.GetDriveTypeW(root) != 3:  # 3 = fixed (not USB stick / network)
+            continue
+        try:
+            free = shutil.disk_usage(root).free
+        except OSError:
+            continue
+        if free > best_free:
+            best, best_free = root, free
+    return best
 
 
 class Thumbs:
@@ -766,9 +821,18 @@ class SettingsPage(QWidget):
         row.addWidget(add)
         row.addWidget(rem)
         row.addStretch(1)
+        self.images_on = QCheckBox("Also back up images and exports (PNG, JPG, TIFF, PDF…)")
+        self.images_on.toggled.connect(self._images_changed)
+        images_hint = QLabel("Off: only drawing files are backed up (Photoshop, Clip Studio, Illustrator, Krita, "
+                             "SAI, Procreate…). Turn on only if you also want copies of exports and references; "
+                             "art folders can contain thousands of them.")
+        images_hint.setObjectName("muted")
+        images_hint.setWordWrap(True)
         gl.addWidget(hint)
         gl.addWidget(self.folders)
         gl.addLayout(row)
+        gl.addWidget(self.images_on)
+        gl.addWidget(images_hint)
         outer.addWidget(g)
 
         # cloud
@@ -867,6 +931,14 @@ class SettingsPage(QWidget):
         self.usage = QLabel()
         self.usage.setObjectName("muted")
         brow = QHBoxLayout()
+        lrow = QHBoxLayout()
+        self.location = QLabel()
+        self.location.setWordWrap(True)
+        move = QPushButton("Change location…")
+        move.setObjectName("primary")
+        move.clicked.connect(lambda: self.window().move_backups())
+        lrow.addWidget(self.location, 1)
+        lrow.addWidget(move, 0, Qt.AlignTop)
         open_vault = QPushButton("Open backup folder")
         open_vault.clicked.connect(lambda: os.startfile(self.cfg.vault_dir))
         report = QPushButton("Something wrong? Send a report…")
@@ -876,7 +948,6 @@ class SettingsPage(QWidget):
         open_logs.clicked.connect(lambda: os.startfile(str(logs.logs_dir())))
         setup = QPushButton("Run setup again…")
         setup.clicked.connect(lambda: self.window().run_setup())
-        brow.addWidget(open_vault)
         brow.addWidget(setup)
         brow.addWidget(open_logs)
         brow.addWidget(report)
@@ -885,18 +956,29 @@ class SettingsPage(QWidget):
         gl.addWidget(self.auto_update)
         gl.addWidget(self.send_reports)
         gl.addLayout(urow)
-        gl.addWidget(self.usage)
         gl.addLayout(brow)
         outer.addWidget(g)
         outer.addStretch(1)
+
+        # where backups are kept: right below the folders, it matters when a disk fills up
+        sg = QGroupBox("Where backups are kept")
+        sl = QVBoxLayout(sg)
+        orow = QHBoxLayout()
+        orow.addWidget(self.usage)
+        orow.addStretch(1)
+        orow.addWidget(open_vault)
+        sl.addLayout(lrow)
+        sl.addLayout(orow)
+        outer.insertWidget(2, sg)
         self.load()
 
     def load(self) -> None:
         widgets = (self.cloud_on, self.keep_all, self.keep_daily, self.keep_deleted, self.max_gb,
                    self.autostart, self.autosave_on, self.keep_autosave, self.snap_on, self.snap_minutes,
-                   self.auto_update, self.send_reports)
+                   self.auto_update, self.send_reports, self.images_on)
         for w in widgets:
             w.blockSignals(True)
+        self.images_on.setChecked(self.cfg.include_images)
         self.auto_update.setChecked(self.cfg.auto_update)
         self.send_reports.setChecked(self.cfg.send_error_reports)
         self.snap_on.setChecked(self.cfg.ps_snapshots)
@@ -944,9 +1026,17 @@ class SettingsPage(QWidget):
     def update_usage(self) -> None:
         s = self.vault.stats()
         self.usage.setText(
-            f"Backups use {fmt_size(s['bytes'])} on this PC · {s['files']} files · {s['versions']} versions\n"
-            f"Stored in {self.cfg.vault_dir}"
+            f"Backups use {fmt_size(s['bytes'])} · {s['files']} files · {s['versions']} versions"
         )
+        try:
+            free = shutil.disk_usage(self.cfg.vault_dir).free
+        except OSError:
+            free = 0
+        low = free < 20 * 1024**3
+        self.location.setText(
+            f"Backups are stored in <b>{self.cfg.vault_dir}</b><br>"
+            + (f"<span style='color:#9b1c1c'>⚠️ Only {fmt_size(free)} free on that drive. "
+               f"Move backups to a drive with more space.</span>" if low else f"{fmt_size(free)} free on that drive"))
 
     def _save(self, reload_engine: bool = True) -> None:
         self.cfg.save()
@@ -1025,6 +1115,12 @@ class SettingsPage(QWidget):
         self.cfg.max_vault_gb = self.max_gb.value()
         self.cfg.keep_autosave_days = self.keep_autosave.value()
         self._save(reload_engine=False)
+
+    def _images_changed(self, on: bool) -> None:
+        self.cfg.include_images = on
+        self._save()  # reloads the watcher; turning it on backs up existing images on the next scan
+        if not on:
+            self.window().offer_image_cleanup(asked_by_her=True)
 
     def _send_reports_changed(self, on: bool) -> None:
         self.cfg.send_error_reports = on
@@ -1106,6 +1202,8 @@ class MainWindow(QMainWindow):
             self.nav.addItem(text)
         self.status = QLabel()
         self.status.setObjectName("status")
+        self.status.setCursor(Qt.PointingHandCursor)
+        self.status.mousePressEvent = lambda e: self.go_settings() if self.engine.disk_full else None
         self.status.setWordWrap(True)
         self.activity = QLabel()
         self.activity.setObjectName("muted")
@@ -1151,6 +1249,101 @@ class MainWindow(QMainWindow):
         else:
             self.settings_page.load()
 
+    def offer_image_cleanup(self, asked_by_her: bool = False) -> None:
+        """Offer to delete backups of image types that aren't backed up anymore."""
+        keep = self.cfg.active_extensions()
+        files, size = self.vault.unwanted_backup_size(keep)
+        self.cfg.pending_image_cleanup = False
+        self.cfg.save()
+        if not files:
+            return
+        intro = ("" if asked_by_her else
+                 "ArtSafe now only backs up your drawing files (Photoshop, Clip Studio, Illustrator…), "
+                 "not every image in your art folders.\n\n")
+        if QMessageBox.question(
+            self, APP_NAME,
+            f"{intro}There are backups of {files} other images (PNG, JPG and so on) taking {fmt_size(size)}.\n\n"
+            "Remove those backups to free up space? Your images themselves are not touched, "
+            "only ArtSafe's extra copies of them."
+        ) != QMessageBox.Yes:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.vault.remove_backups_of_other_types(keep)
+        except Exception:
+            log.exception("Removing image backups failed")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.engine.disk_full = False
+        self.thumbs.cache.clear()
+        self.refresh_all()
+        self.settings_page.update_usage()
+        QMessageBox.information(self, APP_NAME, f"Done! {fmt_size(size)} freed.")
+
+    def move_backups(self) -> None:
+        current = Path(self.cfg.vault_dir)
+        start = best_backup_drive(exclude=current.anchor) or str(Path.home())
+        d = QFileDialog.getExistingDirectory(
+            self, "Choose where to keep backups (a drive with lots of free space)", start)
+        if not d:
+            return
+        target = Path(os.path.normpath(d))
+        if target.name != "ArtSafe Backups":
+            target = target / "ArtSafe Backups"
+        problem = self.vault.check_new_location(target)
+        if problem:
+            QMessageBox.warning(self, APP_NAME, problem)
+            return
+        files, size = self.vault.size_on_disk()
+        if QMessageBox.question(
+            self, APP_NAME,
+            f"Move all backups ({fmt_size(size)}) to:\n{target}\n\n"
+            "Everything is copied and checked first; the old copy is only removed after that. "
+            "Backups pause for a moment while this runs."
+        ) != QMessageBox.Yes:
+            try:
+                target.rmdir()  # remove the empty folder we just made
+            except OSError:
+                pass
+            return
+        dlg = QProgressDialog("Moving your backups…", None, 0, 1000, self)
+        dlg.setWindowTitle(APP_NAME)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        mover = _Mover()
+        mover.progress.connect(lambda done, total: dlg.setValue(int(1000 * done / max(total, 1))))
+
+        def finished(ok: bool, msg: str) -> None:
+            dlg.close()
+            if ok:
+                self.cfg.save()
+                log.info("Backups moved to %s", self.cfg.vault_dir)
+                self.engine.disk_full = False
+                self.engine.request_rescan()
+                self.thumbs.cache.clear()
+                self.settings_page.load()
+                self.refresh_all()
+                QMessageBox.information(self, APP_NAME,
+                                        f"Done! Your backups are now in:\n{self.cfg.vault_dir}\n\n"
+                                        f"{fmt_size(size)} was freed on {current.anchor}")
+            else:
+                log.error("Moving backups to %s failed: %s", target, msg)
+                QMessageBox.warning(self, APP_NAME, f"Moving the backups didn't work, so nothing was "
+                                                    f"changed. Your backups are still in the old place.\n\n{msg}")
+
+        mover.finished.connect(finished)
+        self._mover = mover  # keep it alive
+
+        def work():
+            try:
+                self.vault.relocate(target, progress=mover.progress.emit)
+                mover.finished.emit(True, "")
+            except Exception as e:
+                mover.finished.emit(False, str(e))
+
+        threading.Thread(target=work, name="artsafe-move", daemon=True).start()
+
     def check_updates_now(self) -> None:
         self.settings_page.version_label.setText(f"Version {__version__} · checking…")
         self.updater.check_now()
@@ -1158,7 +1351,7 @@ class MainWindow(QMainWindow):
     def run_setup(self) -> None:
         from .onboarding import Onboarding
 
-        if Onboarding(self.cfg, self).exec():
+        if Onboarding(self.cfg, self, vault=self.vault).exec():
             self.settings_page.load()
             self._settings_changed()
             self.refresh_all()
@@ -1190,7 +1383,8 @@ class MainWindow(QMainWindow):
     def _update_status(self) -> None:
         folders = [f for f in self.cfg.watched_folders if os.path.isdir(f)]
         if self.engine.disk_full:
-            text, bg, fg = "⛔  Disk almost full: backups paused. Free up some space.", "#fde8e8", "#9b1c1c"
+            text, bg, fg = ("⛔  Disk almost full: backups paused. Click here to move backups "
+                            "to another drive."), "#fde8e8", "#9b1c1c"
         elif not self.cfg.watched_folders:
             text, bg, fg = "⚠️  Not protecting anything yet. Add a folder in Settings.", "#fff4e0", "#8a5300"
         elif len(folders) < len(self.cfg.watched_folders):
@@ -1234,6 +1428,29 @@ def report_update_result(just_updated: bool) -> None:
         logs.event("Update failed", last)
 
 
+def wait_for_backup_drive(cfg: Config) -> bool:
+    """If backups live on a drive that isn't there (yet), wait a bit, then ask. False = quit."""
+    anchor = Path(cfg.vault_dir).anchor
+    if not anchor or Path(anchor).exists():
+        return True
+    log.warning("Backup drive %s not available yet; waiting", anchor)
+    for _ in range(30):  # drives can appear a little after Windows starts
+        time.sleep(2)
+        if Path(anchor).exists():
+            return True
+    logs.event("Backup drive missing", f"{anchor} isn't available at start-up")
+    while True:
+        r = QMessageBox.warning(
+            None, APP_NAME,
+            f"The drive with your backups ({anchor}) isn't available.\n\n"
+            "Plug it in (or turn it on) and click Retry. ArtSafe can't make backups until then.",
+            QMessageBox.Retry | QMessageBox.Close)
+        if Path(anchor).exists():
+            return True
+        if r != QMessageBox.Retry:
+            return False
+
+
 def run(argv: list[str]) -> int:
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(argv)
@@ -1261,6 +1478,8 @@ def run(argv: list[str]) -> int:
     log.info("Config: %d folders, cloud=%s, snapshots=%s, autosaves=%s, limit=%s GB",
              len(cfg.watched_folders), cfg.cloud_enabled, cfg.ps_snapshots, cfg.capture_autosaves,
              cfg.max_vault_gb)
+    if not wait_for_backup_drive(cfg):
+        return 0
     vault = Vault(cfg)
     bridge = Bridge()
     engine = Engine(cfg, vault,
@@ -1403,7 +1622,7 @@ def run(argv: list[str]) -> int:
 
     if first_run:
         from .onboarding import Onboarding
-        Onboarding(cfg).exec()  # saves her choices when she clicks Finish
+        Onboarding(cfg, vault=vault).exec()  # saves her choices when she clicks Finish
     # Re-register on every launch so startup keeps working even if the app folder was moved.
     if cfg.start_with_windows:
         try:
@@ -1419,6 +1638,15 @@ def run(argv: list[str]) -> int:
             APP_NAME, f"ArtSafe was updated to version {__version__}.", make_icon(), 5000))
 
     win.settings_page.load()
+    if cfg.pending_image_cleanup:
+        def ask_cleanup():
+            if vault.unwanted_backup_size(cfg.active_extensions())[0]:
+                win.show_and_raise()
+                win.offer_image_cleanup()
+            else:
+                cfg.pending_image_cleanup = False
+                cfg.save()
+        QTimer.singleShot(3000, ask_cleanup)
     if not cfg.watched_folders:
         win.go_settings()
         win.show_and_raise()

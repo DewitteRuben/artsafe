@@ -116,8 +116,10 @@ class ArtFinder(QObject):
 
 # ---------- wizard ----------
 class Onboarding(QDialog):
-    def __init__(self, cfg: Config, parent=None):
+    def __init__(self, cfg: Config, parent=None, vault=None):
         super().__init__(parent)
+        self.vault = vault
+        self.backup_dir = cfg.vault_dir
         from .gui import fmt_size, make_icon  # local import: gui imports this module
 
         self._fmt_size = fmt_size
@@ -271,6 +273,21 @@ class Onboarding(QDialog):
         self.space_note.setWordWrap(True)
         v.addSpacing(6)
         v.addWidget(self.space_note)
+        loc = QFrame()
+        loc.setObjectName("steps")
+        lv = QHBoxLayout(loc)
+        self.loc_label = QLabel()
+        self.loc_label.setWordWrap(True)
+        change = QPushButton("Change…")
+        change.clicked.connect(self._pick_backup_dir)
+        lv.addWidget(self.loc_label, 1)
+        lv.addWidget(change, 0, Qt.AlignTop)
+        # lots of existing backups: moving them belongs in Settings (with a progress bar)
+        self.can_move_here = self.vault is None or self.vault.size_on_disk()[1] < 200 * 1024**2
+        change.setVisible(self.can_move_here)
+        v.addSpacing(6)
+        v.addWidget(loc)
+        self._suggest_backup_dir()
         if not clouds:
             hint = QLabel("No cloud app (OneDrive, Google Drive, Dropbox) was found on this PC. "
                           "You can install one later and turn this on in Settings.")
@@ -410,6 +427,44 @@ class Onboarding(QDialog):
             # cancelled without a folder: fall back to the first option
             next(iter(self.cloud_choices)).setChecked(True)
 
+    def _suggest_backup_dir(self) -> None:
+        """If the current drive is nearly full, suggest the fixed drive with the most space."""
+        import shutil
+        from .gui import best_backup_drive
+
+        try:
+            free = shutil.disk_usage(Path(self.backup_dir).anchor).free
+        except OSError:
+            free = 0
+        if free < 30 * 1024**3 and self.vault is not None and self.can_move_here:
+            other = best_backup_drive(exclude=Path(self.backup_dir).anchor)
+            if other and shutil.disk_usage(other).free > free * 2:
+                self.backup_dir = str(Path(other) / "ArtSafe Backups")
+        self._show_backup_dir()
+
+    def _show_backup_dir(self) -> None:
+        import shutil
+        try:
+            free = shutil.disk_usage(Path(self.backup_dir).anchor).free
+        except OSError:
+            free = 0
+        moved = os.path.normcase(self.backup_dir) != os.path.normcase(self.cfg.vault_dir)
+        note = (" (suggested, because your C: drive is almost full)" if moved and
+                Path(self.cfg.vault_dir).anchor.upper().startswith("C") else "")
+        extra = "" if self.can_move_here else " · to move them, use Settings → Change location"
+        self.loc_label.setText(f"💾  Backups on this PC go to <b>{self.backup_dir}</b>{note}<br>"
+                               f"<span style='color:#6b6a7a'>{self._fmt_size(free)} free on that drive{extra}</span>")
+
+    def _pick_backup_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "Where should ArtSafe keep backups?", Path(self.backup_dir).anchor)
+        if not d:
+            return
+        d = os.path.normpath(d)
+        if Path(d).name != "ArtSafe Backups":
+            d = os.path.join(d, "ArtSafe Backups")
+        self.backup_dir = d
+        self._show_backup_dir()
+
     def chosen_cloud(self) -> str | None:
         rb = self.cloud_group.checkedButton()
         p = self.cloud_choices.get(rb)
@@ -447,6 +502,7 @@ class Onboarding(QDialog):
         cloud = self.chosen_cloud()
         lines = [f"✅  Protecting {len(folders)} folder{'s' if len(folders) != 1 else ''}"]
         lines.append(f"✅  Cloud copy in {pretty_path(cloud)}" if cloud else "➖  No cloud copy (you can turn it on later)")
+        lines.append(f"✅  Backups stored in {pretty_path(self.backup_dir)}")
         lines.append("✅  Photoshop snapshots every 5 minutes" if self.snap.isChecked()
                      else "➖  No Photoshop snapshots")
         if self.startup.isChecked():
@@ -476,6 +532,13 @@ class Onboarding(QDialog):
         c.capture_autosaves = self.autos.isChecked()
         c.start_with_windows = self.startup.isChecked()
         c.first_run_done = True
+        if self.vault is not None and os.path.normcase(self.backup_dir) != os.path.normcase(c.vault_dir):
+            try:
+                self.vault.relocate(self.backup_dir)  # nearly empty at this point, so it's quick
+            except Exception as e:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, APP_NAME, f"Couldn't use {self.backup_dir} for backups ({e}). "
+                                                    f"They stay in {c.vault_dir}; you can change this in Settings.")
         c.save()
         try:
             set_start_with_windows(c.start_with_windows)
