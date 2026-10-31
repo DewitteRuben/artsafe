@@ -146,9 +146,11 @@ def prepare(release: dict) -> Path:
 
 
 APPLY_PS1 = r"""
-param([int]$WaitPid, [string]$NewDir, [string]$AppDir, [string]$Version, [string]$LogDir)
+param([int]$WaitPid, [string]$NewDir, [string]$AppDir, [string]$Version, [string]$LogDir, [switch]$Reopen)
 $ErrorActionPreference = "Stop"
 $log = Join-Path $LogDir "update.log"
+# Reopen the window afterwards if it was open, otherwise start quietly in the tray.
+$mode = if ($Reopen) { "--show" } else { "--tray" }
 function Log($m) { Add-Content -Path $log -Value ("{0}  {1}" -f (Get-Date -Format s), $m) }
 try { Wait-Process -Id $WaitPid -Timeout 60 } catch {}
 Start-Sleep -Seconds 1
@@ -159,23 +161,23 @@ try {
   try {
     Move-Item $NewDir $AppDir
     Log "updated to $Version"
-    Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList "--tray", "--updated" -WorkingDirectory $AppDir
+    Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList $mode, "--updated" -WorkingDirectory $AppDir
     Start-Sleep -Seconds 5
     Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue
   } catch {
     Log "could not move new version in: $_ ; restoring old version"
     if (Test-Path $AppDir) { Remove-Item $AppDir -Recurse -Force -ErrorAction SilentlyContinue }
     Move-Item $old $AppDir
-    Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList "--tray"
+    Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList $mode
   }
 } catch {
   Log "could not replace app folder (in use?): $_ ; keeping current version"
-  Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList "--tray"
+  Start-Process (Join-Path $AppDir "ArtSafe.exe") -ArgumentList $mode
 }
 """
 
 
-def launch_apply(new_app: Path, version: str) -> None:
+def launch_apply(new_app: Path, version: str, reopen: bool = False) -> None:
     """Start the swap script; the caller must quit ArtSafe right after."""
     app_dir = install_dir()
     if app_dir is None:
@@ -185,6 +187,8 @@ def launch_apply(new_app: Path, version: str) -> None:
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
            "-File", str(script), "-WaitPid", str(os.getpid()), "-NewDir", str(new_app),
            "-AppDir", str(app_dir), "-Version", version, "-LogDir", str(logs_dir())]
+    if reopen:
+        cmd.append("-Reopen")
     # NO_WINDOW | NEW_PROCESS_GROUP, and break away from any job so it outlives ArtSafe.
     # (Not DETACHED_PROCESS: PowerShell won't run without a console.)
     base = 0x08000000 | 0x00000200

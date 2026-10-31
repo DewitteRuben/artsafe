@@ -48,6 +48,7 @@ class FileRow:
     version_count: int
     last_backup: float
     latest_blob: str
+    last_saved: float = 0  # when she last saved the file (its modified date), not when ArtSafe copied it
 
     @property
     def name(self) -> str:
@@ -68,6 +69,16 @@ class VersionRow:
     backed_up_at: float
     reason: str
     app: str = ""
+    saved_at: float | None = None  # the file's modified date when it was copied
+
+    @property
+    def when(self) -> float:
+        """When this version was saved. Falls back to the backup time for old backups."""
+        return self.saved_at or self.backed_up_at
+
+
+def _is_blob_name(stem: str) -> bool:
+    return len(stem) == 64 and all(c in "0123456789abcdef" for c in stem)
 
 
 def path_key(p: str | Path) -> str:
@@ -120,6 +131,16 @@ class Vault:
         if "kind" not in cols:
             self.db.execute("ALTER TABLE files ADD COLUMN kind TEXT NOT NULL DEFAULT 'file'")
             self.db.execute("ALTER TABLE files ADD COLUMN app TEXT")
+        vcols = {r[1] for r in self.db.execute("PRAGMA table_info(versions)")}
+        if "saved_at" not in vcols:
+            self.db.execute("ALTER TABLE versions ADD COLUMN saved_at REAL")
+            # Older backups only know when they were copied. The newest copy of each file
+            # matches its last known modified date, so fill that in.
+            self.db.execute(
+                """UPDATE versions SET saved_at=(SELECT last_mtime FROM files WHERE files.id=versions.file_id)
+                   WHERE id IN (SELECT (SELECT id FROM versions v2 WHERE v2.file_id=f.id
+                                        ORDER BY backed_up_at DESC, id DESC LIMIT 1) FROM files f)"""
+            )
         self.db.commit()
 
     # ---------- paths ----------
@@ -220,11 +241,12 @@ class Vault:
             return None
         with self.lock:
             cur = self.db.execute(
-                "INSERT INTO versions(file_id, blob, size, backed_up_at, reason) VALUES(?,?,?,?,?)",
-                (file_id, blob, st.st_size, now, reason),
+                "INSERT INTO versions(file_id, blob, size, backed_up_at, reason, saved_at) VALUES(?,?,?,?,?,?)",
+                (file_id, blob, st.st_size, now, reason, st.st_mtime),
             )
             self.db.commit()
-            version = VersionRow(cur.lastrowid, file_id, str(path), blob, st.st_size, now, reason, app or "")
+            version = VersionRow(cur.lastrowid, file_id, str(path), blob, st.st_size, now, reason, app or "",
+                                 st.st_mtime)
 
         tp = self.thumb_path(blob)
         if not tp.exists():
@@ -276,7 +298,8 @@ class Vault:
     def list_files(self, deleted: bool, search: str = "") -> list[FileRow]:
         q = """
             SELECT f.id, f.path, f.deleted_at, COUNT(v.id), MAX(v.backed_up_at),
-                   (SELECT blob FROM versions WHERE file_id=f.id ORDER BY backed_up_at DESC, id DESC LIMIT 1)
+                   (SELECT blob FROM versions WHERE file_id=f.id ORDER BY backed_up_at DESC, id DESC LIMIT 1),
+                   MAX(COALESCE(v.saved_at, v.backed_up_at))
             FROM files f JOIN versions v ON v.file_id=f.id
             WHERE f.deleted_at IS {} NULL AND f.kind='file'
             GROUP BY f.id
@@ -287,7 +310,7 @@ class Vault:
         if search:
             s = search.lower()
             out = [f for f in out if s in f.path.lower()]
-        sort_key = (lambda f: f.deleted_at or 0) if deleted else (lambda f: f.last_backup)
+        sort_key = (lambda f: f.deleted_at or 0) if deleted else (lambda f: f.last_saved)
         out.sort(key=sort_key, reverse=True)
         return out
 
@@ -295,9 +318,9 @@ class Vault:
         """Every kept auto-save copy, newest first."""
         with self.lock:
             rows = self.db.execute(
-                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason, COALESCE(f.app, '')
+                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason, COALESCE(f.app, ''), v.saved_at
                    FROM versions v JOIN files f ON f.id=v.file_id
-                   WHERE f.kind='autosave' ORDER BY v.backed_up_at DESC, v.id DESC"""
+                   WHERE f.kind='autosave' ORDER BY COALESCE(v.saved_at, v.backed_up_at) DESC, v.id DESC"""
             ).fetchall()
         out = [VersionRow(*r) for r in rows]
         if search:
@@ -309,7 +332,8 @@ class Vault:
         with self.lock:
             r = self.db.execute(
                 """SELECT f.id, f.path, f.deleted_at, COUNT(v.id), MAX(v.backed_up_at),
-                   (SELECT blob FROM versions WHERE file_id=f.id ORDER BY backed_up_at DESC, id DESC LIMIT 1)
+                   (SELECT blob FROM versions WHERE file_id=f.id ORDER BY backed_up_at DESC, id DESC LIMIT 1),
+                   MAX(COALESCE(v.saved_at, v.backed_up_at))
                    FROM files f JOIN versions v ON v.file_id=f.id WHERE f.id=? GROUP BY f.id""",
                 (file_id,),
             ).fetchone()
@@ -318,7 +342,7 @@ class Vault:
     def list_versions(self, file_id: int) -> list[VersionRow]:
         with self.lock:
             rows = self.db.execute(
-                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason
+                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason, COALESCE(f.app, ''), v.saved_at
                    FROM versions v JOIN files f ON f.id=v.file_id
                    WHERE v.file_id=? ORDER BY v.backed_up_at DESC, v.id DESC""",
                 (file_id,),
@@ -328,7 +352,7 @@ class Vault:
     def get_version(self, version_id: int) -> VersionRow | None:
         with self.lock:
             r = self.db.execute(
-                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason
+                """SELECT v.id, v.file_id, f.path, v.blob, v.size, v.backed_up_at, v.reason, COALESCE(f.app, ''), v.saved_at
                    FROM versions v JOIN files f ON f.id=v.file_id WHERE v.id=?""",
                 (version_id,),
             ).fetchone()
@@ -506,7 +530,8 @@ class Vault:
             used = {r[0] for r in self.db.execute("SELECT DISTINCT blob FROM versions")}
             for folder in (self.blobs, self.thumbs):
                 for f in folder.glob("*/*"):
-                    if f.stem in used:
+                    # Only ever ArtSafe's own copies: named by their SHA-256, inside blobs/ or thumbs/.
+                    if f.stem in used or not _is_blob_name(f.stem) or f.parent.parent != folder:
                         continue
                     try:
                         if f.stat().st_mtime < cutoff:  # extra safety: never touch fresh files
@@ -526,7 +551,9 @@ class Vault:
 
     def unwanted_backup_size(self, keep_exts: set[str]) -> tuple[int, int]:
         """(files, bytes that removing their backups would free) for types outside keep_exts."""
-        ids = self._file_ids_not_matching(keep_exts)
+        return self._backup_size(self._file_ids_not_matching(keep_exts))
+
+    def _backup_size(self, ids: list[int]) -> tuple[int, int]:
         if not ids:
             return 0, 0
         with self.lock:
@@ -540,14 +567,41 @@ class Vault:
     def remove_backups_of_other_types(self, keep_exts: set[str]) -> int:
         """Delete backups of files whose type isn't in keep_exts. Her own files aren't touched."""
         ids = self._file_ids_not_matching(keep_exts)
+        self._forget(ids)
+        log.info("Removed backups of %d files of types she no longer backs up", len(ids))
+        return len(ids)
+
+    # ---------- folders she no longer protects ----------
+    def _file_ids_only_under(self, folder: str | Path, still_watched: list[str]) -> list[int]:
+        """Her files (not app auto-saves) inside folder, except ones another watched folder still covers."""
+        def prefix(d):
+            return path_key(d).rstrip("\\/") + os.sep
+        gone = prefix(folder)
+        keep = [prefix(w) for w in still_watched]
+        with self.lock:
+            rows = self.db.execute("SELECT id, path_key FROM files WHERE kind='file'").fetchall()
+        return [i for i, k in rows if k.startswith(gone) and not any(k.startswith(w) for w in keep)]
+
+    def folder_backup_size(self, folder: str | Path, still_watched: list[str]) -> tuple[int, int]:
+        """(files, bytes freed) if the backups of a folder she stopped protecting were removed."""
+        return self._backup_size(self._file_ids_only_under(folder, still_watched))
+
+    def remove_folder_backups(self, folder: str | Path, still_watched: list[str]) -> int:
+        """Delete ArtSafe's copies of files in a folder she stopped protecting.
+        Only touches the backup folder; the folder and her files in it are never touched."""
+        ids = self._file_ids_only_under(folder, still_watched)
+        self._forget(ids)
+        log.info("Removed backups of %d files from a folder she no longer protects", len(ids))
+        return len(ids)
+
+    def _forget(self, ids: list[int]) -> None:
+        """Drop these files' backups from the index, then free the copies nothing else uses."""
         with self.lock:
             for i in ids:
                 self.db.execute("DELETE FROM versions WHERE file_id=?", (i,))
                 self.db.execute("DELETE FROM files WHERE id=?", (i,))
             self.db.commit()
         self._collect_garbage(grace=0)  # unreferenced on purpose: free the space right away
-        log.info("Removed backups of %d files of types she no longer backs up", len(ids))
-        return len(ids)
 
     # ---------- moving to another folder / drive ----------
     def size_on_disk(self) -> tuple[int, int]:

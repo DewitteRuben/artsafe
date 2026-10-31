@@ -407,7 +407,7 @@ class FilesPage(QWidget):
         self.list.clear()
         select = None
         for f in files:
-            when = fmt_time(f.deleted_at if self.deleted else f.last_backup, short=True)
+            when = fmt_time(f.deleted_at if self.deleted else f.last_saved, short=True)
             label = "Deleted" if self.deleted else "Saved"
             n = f.version_count
             item = QListWidgetItem(
@@ -464,7 +464,7 @@ class FilesPage(QWidget):
             tag = "  ← current" if i == 0 and not self.deleted else ""
             item = QListWidgetItem(
                 QIcon(self.thumbs.get(v.blob, v.path, 48)),
-                f"{fmt_time(v.backed_up_at)}{tag}\n{REASONS.get(v.reason, v.reason)} · {fmt_size(v.size)}",
+                f"{fmt_time(v.when)}{tag}\n{REASONS.get(v.reason, v.reason)} · {fmt_size(v.size)}",
             )
             item.setData(Qt.UserRole, v)
             item.setSizeHint(QSize(0, 58))
@@ -522,7 +522,7 @@ class FilesPage(QWidget):
         if self.deleted:
             msg = f"Put “{name}” back in its folder?\n\n{Path(v.path).parent}"
         else:
-            msg = (f"Replace “{name}” with the version from {fmt_time(v.backed_up_at)}?\n\n"
+            msg = (f"Replace “{name}” with the version from {fmt_time(v.when)}?\n\n"
                    "No need to worry: the file as it is right now is kept as a version too, "
                    "so you can always switch back.")
         if Path(v.path).exists() and self.deleted:
@@ -568,7 +568,7 @@ class FilesPage(QWidget):
         if not v:
             return
         p = Path(v.path)
-        stamp = datetime.fromtimestamp(v.backed_up_at).strftime("%Y-%m-%d %H.%M")
+        stamp = datetime.fromtimestamp(v.when).strftime("%Y-%m-%d %H.%M")
         suggested = p.parent / f"{p.stem} (from {stamp}){p.suffix}"
         if not p.parent.exists():
             suggested = Path.home() / "Desktop" / suggested.name
@@ -729,14 +729,14 @@ class AutosavesPage(QWidget):
                  "Clip Studio first copy" if "first opened" in kind else
                  "Clip Studio recovery" if v.app == "Clip Studio" else
                  "Photoshop auto-save")
-        return (f"{self._name(v)}  ·  {fmt_time(v.backed_up_at, short=True)}\n"
+        return (f"{self._name(v)}  ·  {fmt_time(v.when, short=True)}\n"
                 f"{short} · {fmt_size(v.size)}")
 
     def _selected(self, item, _prev=None) -> None:
         if not item:
             return
         v: VersionRow = item.data(Qt.UserRole)
-        self.title.setText(f"{self._name(v)} · {fmt_time(v.backed_up_at)}")
+        self.title.setText(f"{self._name(v)} · {fmt_time(v.when)}")
         self.info.setText(f"{self._kind(v)} · {fmt_size(v.size)} · file “{Path(v.path).name}”")
         self._show_preview(v)
 
@@ -775,7 +775,7 @@ class AutosavesPage(QWidget):
             return
         v: VersionRow = item.data(Qt.UserRole)
         ext = Path(v.path).suffix or ".psb"
-        stamp = datetime.fromtimestamp(v.backed_up_at).strftime("%Y-%m-%d %H.%M")
+        stamp = datetime.fromtimestamp(v.when).strftime("%Y-%m-%d %H.%M")
         suggested = Path.home() / "Desktop" / f"{self._name(v)} (recovered {stamp}){ext}"
         dest, _ = QFileDialog.getSaveFileName(self, "Save the recovered work", str(suggested), f"*{ext}")
         if not dest:
@@ -1060,12 +1060,13 @@ class SettingsPage(QWidget):
         f = item.data(Qt.UserRole)
         if QMessageBox.question(
             self, APP_NAME,
-            f"Stop protecting this folder?\n\n{f}\n\nBackups already made are kept."
+            f"Stop protecting this folder?\n\n{f}\n\nThe folder and your files in it are not touched."
         ) != QMessageBox.Yes:
             return
         self.cfg.watched_folders.remove(f)
         self._save()
         self.load()
+        self.window().offer_folder_cleanup(f)
 
     def _pick_cloud(self) -> None:
         clouds = detect_cloud_folders()
@@ -1272,6 +1273,41 @@ class MainWindow(QMainWindow):
             self.vault.remove_backups_of_other_types(keep)
         except Exception:
             log.exception("Removing image backups failed")
+        finally:
+            QApplication.restoreOverrideCursor()
+        self.engine.disk_full = False
+        self.thumbs.cache.clear()
+        self.refresh_all()
+        self.settings_page.update_usage()
+        QMessageBox.information(self, APP_NAME, f"Done! {fmt_size(size)} freed.")
+
+    def offer_folder_cleanup(self, folder: str) -> None:
+        """After she stops protecting a folder: offer to delete ArtSafe's old copies of its files."""
+        try:
+            files, size = self.vault.folder_backup_size(folder, self.cfg.watched_folders)
+        except Exception:
+            log.exception("Counting folder backups failed")
+            return
+        if not files:
+            return
+        box = QMessageBox(QMessageBox.Question, APP_NAME,
+                          f"ArtSafe still has backups of {files} file{'s' if files != 1 else ''} "
+                          f"from this folder, taking {fmt_size(size)}.\n\n{folder}\n\n"
+                          "Remove those backups to free up space?\n\n"
+                          "Your files in the folder are NOT deleted, only ArtSafe's extra copies of them. "
+                          "Keep the backups if you might still want old versions.", parent=self)
+        remove = box.addButton("Remove backups", QMessageBox.DestructiveRole)
+        keep = box.addButton("Keep them", QMessageBox.RejectRole)
+        box.setDefaultButton(keep)
+        box.exec()
+        if box.clickedButton() is not remove:
+            return
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            self.vault.remove_folder_backups(folder, self.cfg.watched_folders)
+        except Exception:
+            log.exception("Removing folder backups failed")
+            return
         finally:
             QApplication.restoreOverrideCursor()
         self.engine.disk_full = False
@@ -1583,18 +1619,43 @@ def run(argv: list[str]) -> int:
 
     a_quit.triggered.connect(quit_app)
 
-    # ----- updates: install only while the window is closed, so nothing she's doing is interrupted
+    # ----- updates: restart by itself as soon as the update is downloaded.
+    # With the window open she gets a short countdown first; never in the middle of a dialog.
     pending_update: list = []
+    countdown: list = []  # [QMessageBox, seconds left] while counting down
 
     def on_update_status(msg: str) -> None:
         win.settings_page.version_label.setText(f"Version {__version__} · {msg}")
 
-    def try_install_update() -> None:
-        if not pending_update or win.isVisible():
+    def other_windows_open() -> bool:
+        """True while any other ArtSafe window is open (a question, a file picker, a progress bar…)."""
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        mine = {int(win.winId())}
+        if countdown:
+            mine.add(int(countdown[0].winId()))
+        pid, found = os.getpid(), []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def check(hwnd, _):
+            owner = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+            if owner.value == pid and user32.IsWindowVisible(hwnd) and int(hwnd) not in mine:
+                found.append(hwnd)
+            return True
+
+        user32.EnumWindows(check, 0)
+        return bool(found)
+
+    def try_install_update(reopen: bool = False) -> None:
+        if not pending_update or win.isVisible() and not reopen:
             return
+        if other_windows_open():
+            return  # she's in the middle of something; try again shortly
         version, folder = pending_update[0]
         try:
-            updater.launch_apply(folder, version)
+            updater.launch_apply(folder, version, reopen=reopen)
         except Exception as e:
             log.exception("Couldn't start installing update %s", version)
             on_update_status(f"couldn't install update: {e}")
@@ -1609,13 +1670,56 @@ def run(argv: list[str]) -> int:
         vault.close()
         app.quit()
 
+    def countdown_text(version: str, secs: int) -> str:
+        return (f"An update for ArtSafe (version {version}) is ready.\n\n"
+                f"ArtSafe will restart in {secs} seconds to install it, and open again by itself. "
+                "This takes a few seconds; your files stay protected.")
+
+    def tick() -> None:
+        if not countdown or not pending_update:
+            return
+        box, secs = countdown
+        if not win.isVisible():  # she closed the window: no need to wait
+            secs = 0
+        secs = max(0, secs - 1)
+        countdown[1] = secs
+        box.setText(countdown_text(pending_update[0][0], secs))
+        if secs == 0:
+            reopen = win.isVisible()
+            if not reopen or not other_windows_open():
+                box.hide()
+            try_install_update(reopen=reopen)  # waits while another dialog is open
+
+    def start_countdown(version: str) -> None:
+        box = QMessageBox(QMessageBox.Information, APP_NAME, countdown_text(version, 60), parent=win)
+        box.setWindowModality(Qt.NonModal)
+        now_btn = box.addButton("Restart now", QMessageBox.AcceptRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+
+        def clicked(b) -> None:
+            if b is now_btn:
+                countdown[1] = 1  # next tick installs
+            else:  # later: install as soon as the window is closed
+                countdown.clear()
+                on_update_status(f"version {version} will be installed when this window is closed")
+
+        box.buttonClicked.connect(clicked)
+        countdown[:] = [box, 60]
+        box.show()
+
     def on_update_ready(version: str, folder) -> None:
         pending_update[:] = [(version, folder)]
-        on_update_status(f"version {version} will be installed when this window is closed")
-        try_install_update()
+        on_update_status(f"version {version} is ready and will be installed in a moment")
+        if win.isVisible():
+            start_countdown(version)
+        else:
+            try_install_update()
 
-    install_timer = QTimer(interval=60_000)
-    install_timer.timeout.connect(try_install_update)
+    countdown_timer = QTimer(interval=1000)
+    countdown_timer.timeout.connect(tick)
+    countdown_timer.start()
+    install_timer = QTimer(interval=30_000)
+    install_timer.timeout.connect(lambda: try_install_update())
     install_timer.start()
     bridge.update_status.connect(on_update_status)
     bridge.update_ready.connect(on_update_ready)

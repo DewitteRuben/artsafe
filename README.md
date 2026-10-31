@@ -28,7 +28,8 @@ Optional: right-click `ArtSafe.exe` → Show more options → Send to → Deskto
 ArtSafe checks GitHub Releases every 6 hours (and via Settings → "Check for updates"). New versions are
 only installed if they're signed with the private key in `%USERPROFILE%\.artsafe\signing_key.pem`
 (never commit or share it; without it you can't publish updates, so back it up somewhere safe).
-Updates install while the window is closed, then ArtSafe restarts in the tray. If installing fails, the
+Updates install as soon as they are downloaded: right away if the window is closed, otherwise after a 60-second
+notice (never while another ArtSafe dialog is open). ArtSafe then restarts by itself. If installing fails, the
 old version is put back. Her backups and settings live in AppData and are never touched by updates.
 Note: the ArtSafe folder must be somewhere she can write to (e.g. Documents), not Program Files.
 
