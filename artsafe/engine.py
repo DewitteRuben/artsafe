@@ -216,7 +216,11 @@ class Engine:
         else:
             with self._plock:
                 dest = self._moves.pop(path, None)
-            if dest and os.path.isfile(dest) and self.classify(dest) == ("file", None) \
+            # Only a rename if the type stayed the same. "dragon.clip" turning into "dragon.psd"
+            # (Clip Studio exporting, or an extension typed over) is a different file: the .clip
+            # is gone and must stay recoverable as a .clip under Deleted files.
+            same_type = bool(dest) and Path(dest).suffix.lower() == Path(path).suffix.lower()
+            if same_type and os.path.isfile(dest) and self.classify(dest) == ("file", None) \
                     and self.vault.rename(path, dest):
                 log.info("Renamed %s -> %s", path, dest)
                 self._status(f"Noticed {Path(path).name} was renamed to {Path(dest).name}")

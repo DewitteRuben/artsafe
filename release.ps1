@@ -44,7 +44,7 @@ if ($NoPublish) { Write-Host "Built and signed $zip (not published)"; exit 0 }
 
 # 5. commit, tag, publish
 git add -A
-git commit -m "Release v$Version" -m "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+git commit -m "Release v$Version" -m "Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>"
 git tag "v$Version"
 git push origin HEAD --tags
 if (-not $Notes) { $Notes = "ArtSafe $Version" }

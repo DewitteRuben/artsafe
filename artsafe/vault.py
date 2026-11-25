@@ -141,7 +141,46 @@ class Vault:
                    WHERE id IN (SELECT (SELECT id FROM versions v2 WHERE v2.file_id=f.id
                                         ORDER BY backed_up_at DESC, id DESC LIMIT 1) FROM files f)"""
             )
+        if self.db.execute("PRAGMA user_version").fetchone()[0] < 1:
+            moved = self._split_changed_types()
+            if moved:
+                log.info("Recovered %d versions that were filed under a different file type", moved)
+            self.db.execute("PRAGMA user_version=1")
         self.db.commit()
+
+    def _split_changed_types(self) -> int:
+        """Undo what 1.0.2 and older did when a file's type changed (dragon.clip -> dragon.psd).
+
+        They filed the .clip's versions under the .psd, where they couldn't be opened and the
+        .clip never showed up as deleted. The copies are still in blobs/ under their real type,
+        so give them back to a file of that type. Returns how many versions were moved.
+        """
+        have: dict[str, set[str]] = {}
+        for f in self.blobs.glob("*/*"):
+            if _is_blob_name(f.stem):
+                have.setdefault(f.stem, set()).add(f.suffix.lower())
+        rows = self.db.execute(
+            """SELECT v.id, v.blob, v.backed_up_at, f.path FROM versions v JOIN files f ON f.id=v.file_id
+               WHERE f.kind='file' ORDER BY v.backed_up_at, v.id"""
+        ).fetchall()
+        moved = 0
+        for vid, blob, backed_up_at, path in rows:
+            exts = have.get(blob, set())
+            if len(exts) != 1 or Path(path).suffix.lower() in exts:
+                continue  # copy is where it should be (or missing / ambiguous: leave alone)
+            real = Path(path).with_suffix(next(iter(exts)))
+            row = self.db.execute("SELECT id FROM files WHERE path_key=?", (path_key(real),)).fetchone()
+            if row:
+                file_id = row[0]
+            else:
+                # no size/date recorded, so if the file does exist the next scan backs it up afresh
+                file_id = self.db.execute(
+                    "INSERT INTO files(path, path_key, deleted_at, kind) VALUES(?,?,?,'file')",
+                    (str(real), path_key(real), None if real.exists() else backed_up_at),
+                ).lastrowid
+            self.db.execute("UPDATE versions SET file_id=? WHERE id=?", (file_id, vid))
+            moved += 1
+        return moved
 
     # ---------- paths ----------
     def blob_path(self, blob: str, ext: str = "") -> Path:
